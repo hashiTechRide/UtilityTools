@@ -208,3 +208,147 @@ Next.js (React/TypeScript)
 - [ ] パイロット対象システムの選定
 - [ ] React / Next.js 学習計画の策定
 - [ ] オンプレミス環境でのNode.jsサーバー構築検討
+
+---
+
+## 9. オフライン環境でのパッケージ管理
+
+### 9.1 背景・制約
+
+開発環境はコマンドプロンプト（npm, node等）からのWebアクセスが制限されている。
+そのため、**インターネット接続可能な特定のPC**でnpmパッケージをダウンロードし、開発環境にはオフラインでインストールする運用が必要。
+
+### 9.2 関連ファイル一覧
+
+| ファイル | 用途 | 更新タイミング |
+|---------|------|--------------|
+| `package.json` | プロジェクトの依存関係定義 | ライブラリ追加・変更時 |
+| `package-lock.json` | 依存関係の完全なバージョンロック | `npm install` 実行後に自動更新 |
+| `package-urls.txt` | 全依存パッケージのダウンロードURL一覧 | `package-lock.json` 変更時に再生成 |
+| `download-packages.ps1` | パッケージ一括ダウンロードスクリプト | 基本的に変更不要 |
+| `install-offline.ps1` | オフラインインストールスクリプト | 基本的に変更不要 |
+
+### 9.3 運用フロー
+
+```
+[インターネット接続可能なPC]              [開発環境PC（オフライン）]
+                                          
+1. package.json を編集                    
+   （ライブラリ追加・削除・更新）          
+                                          
+2. npm install を実行                     
+   → package-lock.json が更新される       
+                                          
+3. package-urls.txt を再生成（※後述）    
+                                          
+4. download-packages.ps1 を実行           
+   → npm-packages/ に .tgz ファイル群     
+     がダウンロードされる                 
+                                          
+5. 以下をUSB等で開発環境PCにコピー ───→  6. コピーしたファイルを配置
+   - npm-packages/ フォルダ                  - プロジェクトルートに配置
+   - package.json                         
+   - package-lock.json                    7. install-offline.ps1 を実行
+   - install-offline.ps1                     → node_modules/ が生成される
+                                          
+                                          8. npm run dev で開発開始
+```
+
+### 9.4 package-urls.txt の再生成方法
+
+ライブラリに変更があった場合、`package-lock.json` から全依存パッケージのURLを抽出して `package-urls.txt` を更新する必要がある。
+
+#### 方法: Node.jsスクリプトで生成
+
+```javascript
+// generate-package-urls.js
+const lockfile = require('./package-lock.json');
+const urls = new Set();
+
+function extractUrls(packages) {
+  for (const [name, info] of Object.entries(packages)) {
+    if (info.resolved) {
+      urls.add(info.resolved);
+    }
+    if (info.dependencies) {
+      extractUrls(info.dependencies);
+    }
+  }
+}
+
+if (lockfile.packages) {
+  // lockfileVersion 2 or 3
+  for (const [path, info] of Object.entries(lockfile.packages)) {
+    if (info.resolved && info.resolved.startsWith('https://')) {
+      urls.add(info.resolved);
+    }
+  }
+} else if (lockfile.dependencies) {
+  // lockfileVersion 1
+  extractUrls(lockfile.dependencies);
+}
+
+const sorted = [...urls].sort();
+require('fs').writeFileSync('package-urls.txt', sorted.join('\n') + '\n');
+console.log(`Generated package-urls.txt with ${sorted.length} URLs`);
+```
+
+実行:
+```bash
+node generate-package-urls.js
+```
+
+### 9.5 各スクリプトの使い方
+
+#### download-packages.ps1（ダウンロード用PC）
+
+```powershell
+# 基本実行
+powershell -ExecutionPolicy Bypass -File download-packages.ps1
+
+# カスタムパラメータ
+powershell -ExecutionPolicy Bypass -File download-packages.ps1 -urlsFile "package-urls.txt" -downloadDir "npm-packages"
+```
+
+- `package-urls.txt` と同じディレクトリで実行する
+- ダウンロード済みファイルは自動スキップされる（差分ダウンロード可能）
+- 失敗したURLは `failed-downloads.log` に記録される
+- レート制限対策として100msのウェイトが入っている
+
+#### install-offline.ps1（開発環境PC）
+
+```powershell
+# 基本実行
+powershell -ExecutionPolicy Bypass -File install-offline.ps1
+
+# カスタムパッケージディレクトリ指定
+powershell -ExecutionPolicy Bypass -File install-offline.ps1 -packagesDir "npm-packages"
+```
+
+- `package.json`, `package-lock.json`, `npm-packages/` が同じディレクトリにある状態で実行する
+- 既存の `node_modules/` は自動削除される
+- npmのオフラインキャッシュ機能を利用してインストールする
+
+### 9.6 ⚠️ ライブラリ変更時の必須手順チェックリスト
+
+**ライブラリを追加・更新・削除するたびに、以下を必ず実施すること。**
+
+- [ ] インターネット接続可能なPCで `npm install` を実行
+- [ ] `package-lock.json` が更新されたことを確認
+- [ ] `node generate-package-urls.js` を実行して `package-urls.txt` を再生成
+- [ ] `download-packages.ps1` を実行して新しいパッケージをダウンロード
+- [ ] 以下のファイルを開発環境PCにコピー:
+  - `package.json`
+  - `package-lock.json`
+  - `npm-packages/` フォルダ（全 .tgz ファイル）
+- [ ] 開発環境PCで `install-offline.ps1` を実行
+- [ ] `npm run dev` で正常に動作することを確認
+
+### 9.7 トラブルシューティング
+
+| 症状 | 原因 | 対処 |
+|------|------|------|
+| `install-offline.ps1` でエラー | `package-lock.json` と `.tgz` ファイルの不整合 | URLリストを再生成し、全パッケージを再ダウンロード |
+| 一部パッケージのダウンロード失敗 | ネットワークの一時的な問題 | `download-packages.ps1` を再実行（既存ファイルはスキップされる） |
+| `npm run dev` で起動しない | `node_modules/` のインストール不完全 | `node_modules/` を削除して `install-offline.ps1` を再実行 |
+| 新しいパッケージが見つからない | `package-urls.txt` の更新漏れ | `generate-package-urls.js` で再生成してからダウンロード |
